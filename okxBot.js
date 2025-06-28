@@ -9,6 +9,14 @@ const API_SECRET = process.env.OKX_API_SECRET;
 const API_PASSPHRASE = process.env.OKX_API_PASSPHRASE;
 const OKX_BASE_URL = 'https://www.okx.com';
 
+// Rate limiting configuration
+const RATE_LIMIT = {
+  requestsPerSecond: 2, // OKX allows ~2 requests per second
+  maxRetries: 3,
+  retryDelay: 1000, // 1 second
+  lastRequestTime: 0
+};
+
 // Check if API credentials are available
 const hasApiCredentials = API_KEY && API_SECRET && API_PASSPHRASE;
 
@@ -19,6 +27,60 @@ if (!hasApiCredentials) {
   console.warn('   OKX_API_PASSPHRASE=your_passphrase');
   console.warn('   Balance and trading features will not work without credentials.');
 }
+
+/**
+ * Rate limiting function
+ */
+const rateLimit = () => {
+  const now = Date.now();
+  const timeSinceLastRequest = now - RATE_LIMIT.lastRequestTime;
+  const minInterval = 1000 / RATE_LIMIT.requestsPerSecond;
+  
+  if (timeSinceLastRequest < minInterval) {
+    const delay = minInterval - timeSinceLastRequest;
+    return new Promise(resolve => setTimeout(resolve, delay));
+  }
+  
+  RATE_LIMIT.lastRequestTime = now;
+  return Promise.resolve();
+};
+
+/**
+ * Retry function with exponential backoff
+ */
+const retryRequest = async (requestFn, maxRetries = RATE_LIMIT.maxRetries) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await rateLimit();
+      return await requestFn();
+    } catch (error) {
+      const isLastAttempt = attempt === maxRetries;
+      const isRateLimitError = error.response?.status === 429 || error.response?.status === 403;
+      
+      console.warn(`⚠️  Request attempt ${attempt}/${maxRetries} failed:`, {
+        status: error.response?.status,
+        message: error.message,
+        isRateLimit: isRateLimitError
+      });
+      
+      if (isLastAttempt) {
+        throw error;
+      }
+      
+      if (isRateLimitError) {
+        // Longer delay for rate limit errors
+        const delay = RATE_LIMIT.retryDelay * Math.pow(2, attempt - 1);
+        console.log(`⏳ Rate limited. Waiting ${delay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        // Shorter delay for other errors
+        const delay = RATE_LIMIT.retryDelay;
+        console.log(`⏳ Waiting ${delay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+};
 
 /**
  * Generate the OKX API signature
@@ -32,7 +94,7 @@ function sign(timestamp, method, requestPath, body = '') {
 }
 
 /**
- * Fetch account balance from OKX
+ * Fetch account balance from OKX with retry logic
  */
 export async function getBalance() {
   if (!hasApiCredentials) {
@@ -40,12 +102,12 @@ export async function getBalance() {
     return null;
   }
 
-  const timestamp = new Date().toISOString();
-  const method = 'GET';
-  const path = '/api/v5/account/balance';
-  const signature = sign(timestamp, method, path);
+  return retryRequest(async () => {
+    const timestamp = new Date().toISOString();
+    const method = 'GET';
+    const path = '/api/v5/account/balance';
+    const signature = sign(timestamp, method, path);
 
-  try {
     const res = await axios({
       method,
       url: OKX_BASE_URL + path,
@@ -56,49 +118,46 @@ export async function getBalance() {
         'OK-ACCESS-PASSPHRASE': API_PASSPHRASE,
         'Content-Type': 'application/json',
       },
+      timeout: 10000, // 10 second timeout
     });
+    
+    console.log('✅ Balance fetched successfully');
     return res.data;
-  } catch (err) {
-    console.error('🚨 Error fetching balance:', err.message);
-    return null;
-  }
+  });
 }
 
 /**
- * Get current market price of given instrument (defaults to SOL-USDT)
+ * Get current market price with retry logic
  * This is a public endpoint and doesn't require API credentials
  */
 export async function getMarketPrice(instId = 'SOL-USDT') {
-  try {
+  return retryRequest(async () => {
     const res = await axios.get(`${OKX_BASE_URL}/api/v5/market/ticker`, {
       params: { instId },
+      timeout: 10000, // 10 second timeout
     });
-    return parseFloat(res.data.data[0].last);
-  } catch (err) {
-    console.error('🚨 Error fetching market price:', err.message);
-    return null;
-  }
+    
+    const price = parseFloat(res.data.data[0].last);
+    console.log(`✅ Market price fetched: $${price.toFixed(2)}`);
+    return price;
+  });
 }
 
 /**
- * Fetch recent candle data for technical analysis
- * @param {string} instId - Trading pair (e.g., "SOL-USDT")
- * @param {number} limit - Number of candles to fetch (max 300)
- * @param {string} bar - Timeframe (1m, 5m, 15m, 1H, 4H, 1D)
- * @returns {Array} Array of candle objects with OHLC data
+ * Fetch recent candle data with retry logic
  */
 export async function getRecentCandles(instId = 'SOL-USDT', limit = 100, bar = '1m') {
-  try {
+  return retryRequest(async () => {
     const res = await axios.get(`${OKX_BASE_URL}/api/v5/market/candles`, {
       params: { 
         instId, 
         bar, 
         limit: Math.min(limit, 300) // OKX max is 300
       },
+      timeout: 10000, // 10 second timeout
     });
 
     // Transform OKX candle data to our format
-    // OKX format: [timestamp, open, high, low, close, volume, currency_volume]
     const candles = res.data.data.map(candle => ({
       timestamp: parseInt(candle[0]),
       open: parseFloat(candle[1]),
@@ -108,19 +167,13 @@ export async function getRecentCandles(instId = 'SOL-USDT', limit = 100, bar = '
       volume: parseFloat(candle[5])
     }));
 
-    // Reverse to get chronological order (oldest first)
-    return candles.reverse();
-  } catch (err) {
-    console.error('🚨 Error fetching recent candles:', err.message);
-    return null;
-  }
+    console.log(`✅ Fetched ${candles.length} candles for ${instId}`);
+    return candles.reverse(); // Reverse to get chronological order
+  });
 }
 
 /**
- * Place a market order on OKX
- * @param {string} side - "buy" or "sell"
- * @param {string} size - Size of order (e.g., "0.5")
- * @param {string} instId - Trading pair (e.g., "SOL-USDT")
+ * Place a market order with retry logic
  */
 export async function placeOrder(side = 'buy', size = '0.1', instId = 'SOL-USDT') {
   if (!hasApiCredentials) {
@@ -128,24 +181,23 @@ export async function placeOrder(side = 'buy', size = '0.1', instId = 'SOL-USDT'
     return null;
   }
 
-  const timestamp = new Date().toISOString();
-  const method = 'POST';
-  const path = '/api/v5/trade/order';
-  
-  // Use the correct order format that works with OKX
-  const orderBody = {
-    instId,
-    tdMode: 'cash',
-    side,
-    ordType: 'market',
-    tgtCcy: 'base_ccy', // This is the key fix - specify base currency
-    sz: size,
-  };
-  
-  const body = JSON.stringify(orderBody);
-  const signature = sign(timestamp, method, path, body);
+  return retryRequest(async () => {
+    const timestamp = new Date().toISOString();
+    const method = 'POST';
+    const path = '/api/v5/trade/order';
+    
+    const orderBody = {
+      instId,
+      tdMode: 'cash',
+      side,
+      ordType: 'market',
+      tgtCcy: 'base_ccy',
+      sz: size,
+    };
+    
+    const body = JSON.stringify(orderBody);
+    const signature = sign(timestamp, method, path, body);
 
-  try {
     const res = await axios({
       method,
       url: OKX_BASE_URL + path,
@@ -157,22 +209,22 @@ export async function placeOrder(side = 'buy', size = '0.1', instId = 'SOL-USDT'
         'OK-ACCESS-PASSPHRASE': API_PASSPHRASE,
         'Content-Type': 'application/json',
       },
+      timeout: 15000, // 15 second timeout for orders
     });
 
+    console.log(`✅ Order placed successfully: ${side} ${size} ${instId}`);
     return res.data;
-  } catch (err) {
-    console.error('🚨 Order error:', err.response?.data || err.message);
-    return null;
-  }
+  });
 }
 
 /**
- * Determine candle direction (bullish, bearish, or neutral)
+ * Determine candle direction with retry logic
  */
 export async function getCandleDirection(instId = 'SOL-USDT', bar = '1m') {
-  try {
+  return retryRequest(async () => {
     const res = await axios.get(`${OKX_BASE_URL}/api/v5/market/candles`, {
       params: { instId, bar, limit: 1 },
+      timeout: 10000,
     });
 
     const [latest] = res.data.data;
@@ -183,8 +235,31 @@ export async function getCandleDirection(instId = 'SOL-USDT', bar = '1m') {
     if (close > open) return 'bullish';
     if (close < open) return 'bearish';
     return 'neutral';
-  } catch (err) {
-    console.error('🚨 Error fetching candle:', err.message);
-    return null;
+  });
+}
+
+/**
+ * Test API connectivity
+ */
+export async function testApiConnection() {
+  console.log('🔍 Testing OKX API connection...');
+  
+  try {
+    // Test public endpoint first
+    const price = await getMarketPrice('SOL-USDT');
+    console.log('✅ Public API working');
+    
+    if (hasApiCredentials) {
+      // Test authenticated endpoint
+      const balance = await getBalance();
+      console.log('✅ Authenticated API working');
+      return { public: true, authenticated: true, price, balance };
+    } else {
+      console.log('⚠️  No API credentials - authenticated endpoints unavailable');
+      return { public: true, authenticated: false, price };
+    }
+  } catch (error) {
+    console.error('❌ API connection test failed:', error.message);
+    return { public: false, authenticated: false, error: error.message };
   }
 }

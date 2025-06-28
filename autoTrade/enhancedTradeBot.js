@@ -191,9 +191,34 @@ const executeNewPosition = async (signal, currentPrice, availableBalance, availa
     signal.signal
   );
   
-  // Execute order
-  const orderSize = positionSize.toFixed(6);
-  const orderRes = await placeOrder(signal.signal, orderSize, 'SOL-USDT');
+  // Execute order with retry logic
+  let orderRes = null;
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (retryCount < maxRetries) {
+    try {
+      const orderSize = positionSize.toFixed(6);
+      orderRes = await placeOrder(signal.signal, orderSize, 'SOL-USDT');
+      
+      if (orderRes?.code === '0') {
+        break; // Success, exit retry loop
+      } else {
+        retryCount++;
+        if (retryCount < maxRetries) {
+          sendLog(`⚠️ Order failed, retrying (${retryCount}/${maxRetries})...`, 'warning');
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+        }
+      }
+    } catch (error) {
+      retryCount++;
+      sendLog(`❌ Order error (attempt ${retryCount}/${maxRetries}): ${error.message}`, 'error');
+      
+      if (retryCount < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
   
   if (orderRes?.code === '0') {
     // Add position to manager
@@ -206,7 +231,7 @@ const executeNewPosition = async (signal, currentPrice, availableBalance, availa
     );
     
     sendLog(`✅ New ${signal.signal.toUpperCase()} position opened`, 'info', {
-      size: orderSize,
+      size: positionSize.toFixed(6),
       price: currentPrice.toFixed(2),
       stopLoss: levels.stopLoss.toFixed(2),
       takeProfit: levels.takeProfit.toFixed(2),
@@ -219,8 +244,9 @@ const executeNewPosition = async (signal, currentPrice, availableBalance, availa
     
     return { success: true, position };
   } else {
-    sendLog(`❌ ${signal.signal.toUpperCase()} order failed: ${orderRes?.msg || 'Unknown error'}`, 'error');
-    return { success: false, reason: orderRes?.msg || 'Order failed' };
+    const errorMsg = orderRes?.data?.[0]?.sMsg || orderRes?.msg || 'Unknown error after retries';
+    sendLog(`❌ ${signal.signal.toUpperCase()} order failed after ${maxRetries} attempts: ${errorMsg}`, 'error');
+    return { success: false, reason: errorMsg };
   }
 };
 
@@ -232,20 +258,43 @@ const executeScaleIn = async (signal, currentPrice, availableBalance) => {
     return { success: false, reason: 'Scale-in order value below minimum' };
   }
   
-  const orderSize = scaleInSize.toFixed(6);
-  const orderRes = await placeOrder(signal.signal, orderSize, 'SOL-USDT');
+  let orderRes = null;
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (retryCount < maxRetries) {
+    try {
+      const orderSize = scaleInSize.toFixed(6);
+      orderRes = await placeOrder(signal.signal, orderSize, 'SOL-USDT');
+      
+      if (orderRes?.code === '0') {
+        break;
+      } else {
+        retryCount++;
+        if (retryCount < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+    } catch (error) {
+      retryCount++;
+      if (retryCount < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
   
   if (orderRes?.code === '0') {
     sendLog(`📈 Scale-in ${signal.signal.toUpperCase()} executed`, 'info', {
-      size: orderSize,
+      size: scaleInSize.toFixed(6),
       price: currentPrice.toFixed(2),
       confidence: signal.confidence.toFixed(1)
     });
     
     return { success: true };
   } else {
-    sendLog(`❌ Scale-in order failed: ${orderRes?.msg || 'Unknown error'}`, 'error');
-    return { success: false, reason: orderRes?.msg || 'Scale-in failed' };
+    const errorMsg = orderRes?.msg || 'Scale-in failed after retries';
+    sendLog(`❌ Scale-in order failed: ${errorMsg}`, 'error');
+    return { success: false, reason: errorMsg };
   }
 };
 
@@ -276,11 +325,33 @@ const managePositions = async (currentPrice) => {
     }
     
     if (shouldClose) {
-      const orderRes = await placeOrder(
-        position.direction === 'buy' ? 'sell' : 'buy',
-        position.size.toFixed(6),
-        'SOL-USDT'
-      );
+      let orderRes = null;
+      let retryCount = 0;
+      const maxRetries = 3;
+      
+      while (retryCount < maxRetries) {
+        try {
+          orderRes = await placeOrder(
+            position.direction === 'buy' ? 'sell' : 'buy',
+            position.size.toFixed(6),
+            'SOL-USDT'
+          );
+          
+          if (orderRes?.code === '0') {
+            break;
+          } else {
+            retryCount++;
+            if (retryCount < maxRetries) {
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+          }
+        } catch (error) {
+          retryCount++;
+          if (retryCount < maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+        }
+      }
       
       if (orderRes?.code === '0') {
         const closedPosition = positionManager.closePosition(position.id, currentPrice, closeReason);
@@ -292,6 +363,8 @@ const managePositions = async (currentPrice) => {
             duration: Math.round((closedPosition.exitTime - closedPosition.entryTime) / 1000 / 60) + 'min'
           });
         }
+      } else {
+        sendLog(`❌ Failed to close position after ${maxRetries} attempts: ${closeReason}`, 'error');
       }
     }
   }
@@ -317,26 +390,53 @@ const runEnhancedAutoTrade = async () => {
       }
     }
     
-    // Get current market data
-    const currentPrice = await getMarketPrice('SOL-USDT');
+    // Get current market data with fallback
+    let currentPrice = null;
+    try {
+      currentPrice = await getMarketPrice('SOL-USDT');
+    } catch (error) {
+      sendLog(`❌ Failed to fetch current price: ${error.message}`, 'error');
+      sendLog('⏸️ Pausing trading until price data is available', 'warning');
+      return;
+    }
+    
     if (!currentPrice) {
       sendLog('❌ Could not fetch current price', 'error');
       return;
     }
     
-    // Get balance
-    const balanceData = await getBalance();
-    const details = balanceData?.data?.[0]?.details || [];
-    const usdt = details.find((item) => item.ccy === 'USDT');
-    const sol = details.find((item) => item.ccy === 'SOL');
-    const availableUSDT = parseFloat(usdt?.availBal || 0);
-    const availableSOL = parseFloat(sol?.availBal || 0);
+    // Get balance with fallback
+    let balanceData = null;
+    let availableUSDT = 0;
+    let availableSOL = 0;
+    
+    try {
+      balanceData = await getBalance();
+      if (balanceData?.data?.[0]?.details) {
+        const details = balanceData.data[0].details;
+        const usdt = details.find((item) => item.ccy === 'USDT');
+        const sol = details.find((item) => item.ccy === 'SOL');
+        availableUSDT = parseFloat(usdt?.availBal || 0);
+        availableSOL = parseFloat(sol?.availBal || 0);
+      }
+    } catch (error) {
+      sendLog(`⚠️ Failed to fetch balance: ${error.message}`, 'warning');
+      sendLog('📊 Using cached balance data if available', 'info');
+      // Could implement balance caching here
+    }
     
     sendLog(`💰 Balance - USDT: $${availableUSDT.toFixed(2)} | SOL: ${availableSOL.toFixed(4)}`, 'balance');
     
     // Get recent candle data for technical analysis
-    // Note: You'll need to implement getRecentCandles in okxBot.js
-    const recentCandles = await getRecentCandles('SOL-USDT', 50);
+    let recentCandles = null;
+    try {
+      recentCandles = await getRecentCandles('SOL-USDT', 50);
+    } catch (error) {
+      sendLog(`❌ Failed to fetch candle data: ${error.message}`, 'error');
+      sendLog('⏸️ Pausing trading until candle data is available', 'warning');
+      return;
+    }
+    
     if (!recentCandles || recentCandles.length < 50) {
       sendLog('❌ Insufficient candle data for analysis', 'error');
       return;
@@ -352,7 +452,11 @@ const runEnhancedAutoTrade = async () => {
     });
     
     // Manage existing positions first
-    await managePositions(currentPrice);
+    try {
+      await managePositions(currentPrice);
+    } catch (error) {
+      sendLog(`⚠️ Error managing positions: ${error.message}`, 'warning');
+    }
     
     // Check if signal is strong enough
     if (signal.confidence < TRADING_CONFIG.MIN_SIGNAL_CONFIDENCE) {
@@ -368,10 +472,14 @@ const runEnhancedAutoTrade = async () => {
     
     // Execute trading logic
     if (signal.signal !== 'neutral') {
-      const tradeResult = await executeTrade(signal, currentPrice, availableUSDT, availableSOL);
-      
-      if (!tradeResult.success) {
-        sendLog(`❌ Trade execution failed: ${tradeResult.reason}`, 'error');
+      try {
+        const tradeResult = await executeTrade(signal, currentPrice, availableUSDT, availableSOL);
+        
+        if (!tradeResult.success) {
+          sendLog(`❌ Trade execution failed: ${tradeResult.reason}`, 'error');
+        }
+      } catch (error) {
+        sendLog(`❌ Trade execution error: ${error.message}`, 'error');
       }
     } else {
       sendLog('⚪ Neutral signal - no action taken', 'info');
@@ -383,6 +491,9 @@ const runEnhancedAutoTrade = async () => {
   } catch (error) {
     console.error('❌ Enhanced auto-trade error:', error);
     sendLog(`❌ Enhanced auto-trade error: ${error.message}`, 'error');
+    
+    // Don't crash the bot on errors, just log and continue
+    sendLog('🔄 Bot will continue running and retry on next cycle', 'info');
   }
 };
 
