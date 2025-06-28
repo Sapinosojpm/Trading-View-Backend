@@ -81,6 +81,42 @@ export async function getMarketPrice(instId = 'SOL-USDT') {
 }
 
 /**
+ * Fetch recent candle data for technical analysis
+ * @param {string} instId - Trading pair (e.g., "SOL-USDT")
+ * @param {number} limit - Number of candles to fetch (max 300)
+ * @param {string} bar - Timeframe (1m, 5m, 15m, 1H, 4H, 1D)
+ * @returns {Array} Array of candle objects with OHLC data
+ */
+export async function getRecentCandles(instId = 'SOL-USDT', limit = 100, bar = '1m') {
+  try {
+    const res = await axios.get(`${OKX_BASE_URL}/api/v5/market/candles`, {
+      params: { 
+        instId, 
+        bar, 
+        limit: Math.min(limit, 300) // OKX max is 300
+      },
+    });
+
+    // Transform OKX candle data to our format
+    // OKX format: [timestamp, open, high, low, close, volume, currency_volume]
+    const candles = res.data.data.map(candle => ({
+      timestamp: parseInt(candle[0]),
+      open: parseFloat(candle[1]),
+      high: parseFloat(candle[2]),
+      low: parseFloat(candle[3]),
+      close: parseFloat(candle[4]),
+      volume: parseFloat(candle[5])
+    }));
+
+    // Reverse to get chronological order (oldest first)
+    return candles.reverse();
+  } catch (err) {
+    console.error('🚨 Error fetching recent candles:', err.message);
+    return null;
+  }
+}
+
+/**
  * Place a market order on OKX
  * @param {string} side - "buy" or "sell"
  * @param {string} size - Size of order (e.g., "0.5")
