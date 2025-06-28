@@ -20,8 +20,22 @@ connectDB().then(() => {
   initializeDefaultSwitches();
 });
 
+// CORS configuration
+const corsOptions = {
+  origin: [
+    'http://localhost:5173', // Vite dev server
+    'http://localhost:3000', // React dev server
+    'https://trading-view-frontend.vercel.app', // Vercel production
+    'https://trading-view-frontend-git-main.vercel.app', // Vercel preview deployments
+    'https://trading-view-frontend-*.vercel.app' // Vercel branch deployments
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+};
+
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Initialize WebSocket
